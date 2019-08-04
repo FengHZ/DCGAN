@@ -1,20 +1,15 @@
 import argparse
-from model.discriminator import Discriminator
-from model.generator import Generator
-from lib.utils.avgmeter import AverageMeter
-from lib.dataloader import CelebADataset
-from torch.utils.data import DataLoader
 import os
-import torch
 from os import path
 import time
 import shutil
 from random import sample
-from torch.utils.tensorboard import SummaryWriter
 import pickle
 import ast
-from torch import nn
-from torchvision import utils
+from model.discriminator import Discriminator
+from model.generator import Generator
+from lib.utils.avgmeter import AverageMeter
+from lib.dataloader import CelebADataset
 
 
 def arg_as_list(s):
@@ -25,10 +20,10 @@ def arg_as_list(s):
 
 
 parser = argparse.ArgumentParser(description='Pytorch Training DCGAN for CelebA Dataset')
-parser.add_argument('-bp', '--base_path', default="/data/fhz")
-parser.add_argument('-j', '--workers', default=64, type=int, metavar='N',
+parser.add_argument('-bp', '--base-path', default="/data/fhz")
+parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
-parser.add_argument('--epochs', default=5, type=int, metavar='N',
+parser.add_argument('--epochs', default=200, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
@@ -47,6 +42,15 @@ parser.add_argument('-is', '--image-size', default=64, type=int, help="The crop 
 parser.add_argument('--lr', '--learning-rate', default=2e-4, type=float,
                     metavar='LR', help='initial learning rate')
 parser.add_argument('-b1', '--beta1', default=0.5, type=float, metavar='Beta1 In ADAM', help='beta1 for adam')
+## here we add the equilibrium strategy
+parser.add_argument('-dxe', '--dx-equilibrium', default=0.25, type=float,
+                    help="The equilibrium value for discriminator x")
+parser.add_argument('-dgz1e', '--dgz1-equilibrium', default=0.2, type=float,
+                    help="The 1th equilibrium value for discriminator for the generator z")
+parser.add_argument('-dgz2e', '--dgz2-equilibrium', default=0.2, type=float,
+                    help="The 2th equilibrium value of discriminator for the generator z")
+parser.add_argument("--decay-lr", default=0.99, action="store", type=float, dest="decay_lr")
+parser.add_argument("--decay-equilibrium", default=0.99, action="store", type=float, dest="decay_equilibrium")
 # network parameters
 parser.add_argument('-nc', '--num-channel', default=3, type=int, help="The image channel")
 parser.add_argument('-ld', '--latent-dim', default=100, type=int, help="The latent dim for generator")
@@ -62,12 +66,19 @@ parser.add_argument('-fl', '--fake-label', default=0, type=int, help="The label 
 # GPU and data parallel parameters
 parser.add_argument("--gpu", default="0,1", type=str, metavar='GPU plans to use', help='The GPU id plans to use')
 parser.add_argument('-dp', '--data-parallel', action='store_true', help='Use Data Parallel')
+args = parser.parse_args()
+os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+
+# import package about torch
+import torch
+from torch.utils.data import DataLoader
+from torch import nn
+from torchvision import utils
+from torch.utils.tensorboard import SummaryWriter
+from torch.optim.lr_scheduler import MultiStepLR, ExponentialLR
 
 
-def main():
-    global args
-    args = parser.parse_args()
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+def main(args=args):
     dataset_base_path = path.join(args.base_path, "dataset", "celeba")
     image_base_path = path.join(dataset_base_path, "img_align_celeba")
     split_dataset_path = path.join(dataset_base_path, "Eval", "list_eval_partition.txt")
@@ -105,6 +116,8 @@ def main():
         args.train_time, len(train_data_name_list), len(valid_data_name_list)))
     d_optimizer = torch.optim.Adam(discriminator.parameters(), lr=args.lr, betas=(args.beta1, 0.999))
     g_optimizer = torch.optim.Adam(generator.parameters(), lr=args.lr, betas=(args.beta1, 0.999))
+    d_scheduler = ExponentialLR(d_optimizer, gamma=args.decay_lr)
+    g_scheduler = ExponentialLR(g_optimizer, gamma=args.decay_lr)
     writer_log_dir = "{}/DCGAN/runs/train_time:{}".format(args.base_path, args.train_time)
     # Here we implement the resume part
     if args.resume:
@@ -138,6 +151,9 @@ def main():
     criterion = nn.BCELoss()
     for epoch in range(args.start_epoch, args.epochs):
         train(train_dloader, generator, discriminator, g_optimizer, d_optimizer, criterion, writer, epoch)
+        # adjust lr
+        d_scheduler.step()
+        g_scheduler.step()
         # save parameters
         save_checkpoint({
             'epoch': epoch + 1,
@@ -155,11 +171,17 @@ def train(train_dloader, generator, discriminator, g_optimizer, d_optimizer, cri
     generator_loss = AverageMeter()
     discriminator_real_loss = AverageMeter()
     discriminator_fake_loss = AverageMeter()
+    dx_record = AverageMeter()
+    dgz1_record = AverageMeter()
+    dgz2_record = AverageMeter()
     generator.train()
     discriminator.train()
     end = time.time()
     g_optimizer.zero_grad()
     d_optimizer.zero_grad()
+    dx_equilibrium = args.dx_equilibrium * (args.decay_equilibrium) ** epoch
+    dgz1_equilibrium = args.dgz1_equilibrium * (args.decay_equilibrium) ** epoch
+    dgz2_equilibrium = args.dgz2_equilibrium * (args.decay_equilibrium) ** epoch
     for i, (real_image, index, *_) in enumerate(train_dloader):
         data_time.update(time.time() - end)
         real_image = real_image.cuda()
@@ -174,6 +196,9 @@ def train(train_dloader, generator, discriminator, g_optimizer, d_optimizer, cri
         d_x = output.mean().item()
         # calculate the discriminator loss in real image
         d_loss_real = criterion(output, real_label)
+        # equilibrium strategy
+        if d_x <= 0.5 + dx_equilibrium:
+            d_loss_real.backward()
         # use discriminator to distinguish the fake images
         fake = generator(noise)
         # here we only train discriminator, so we use fake.detach()
@@ -184,9 +209,10 @@ def train(train_dloader, generator, discriminator, g_optimizer, d_optimizer, cri
         fake_label = torch.full((batch_size,), args.fake_label).cuda()
         # calculate the discriminator loss in fake image
         d_loss_fake = criterion(output, fake_label)
+        # equilibrium strategy
+        if d_gz_1 >= 0.5 - dgz1_equilibrium:
+            d_loss_fake.backward()
         # optimize discriminator
-        d_loss = d_loss_real + d_loss_fake
-        d_loss.backward()
         d_optimizer.step()
         # here we train generator to make their generator image looks more real
         # one trick for generator is to use  max log(D) instead of min log(1-D)
@@ -196,19 +222,22 @@ def train(train_dloader, generator, discriminator, g_optimizer, d_optimizer, cri
         d_gz_2 = output.mean().item()
         # calculate the g_loss
         g_loss = criterion(output, g_label)
-        g_loss.backward()
+        if d_gz_2 <= 0.5 - dgz2_equilibrium:
+            g_loss.backward()
         g_optimizer.step()
         # zero grad each optimizer
         d_optimizer.zero_grad()
         g_optimizer.zero_grad()
         # update d loss and g loss
-        generator_loss.update(float(g_loss))
-        discriminator_fake_loss.update(float(d_loss_fake))
-        discriminator_real_loss.update(float(d_loss_real))
 
+        generator_loss.update(float(g_loss), batch_size)
+        discriminator_fake_loss.update(float(d_loss_fake), batch_size)
+        discriminator_real_loss.update(float(d_loss_real), batch_size)
+        dx_record.update(float(d_x), batch_size)
+        dgz1_record.update(float(d_gz_1), batch_size)
+        dgz2_record.update(float(d_gz_2), batch_size)
         batch_time.update(time.time() - end)
         end = time.time()
-
         if i % args.print_freq == 0:
             train_text = 'Epoch: [{0}][{1}/{2}]\t' \
                          'D(x) [{3:.4f}] D(G(z)) [{4:.4f}/{5:.4f}]\t' \
@@ -220,19 +249,22 @@ def train(train_dloader, generator, discriminator, g_optimizer, d_optimizer, cri
                 epoch, i + 1, len(train_dloader), d_x, d_gz_1, d_gz_2, batch_time=batch_time,
                 data_time=data_time, drl=discriminator_real_loss, dfl=discriminator_fake_loss, gl=generator_loss)
             print(train_text)
-    writer.add_scalar(tag="DCGAN/DRL", scalar_value=discriminator_real_loss.avg, global_step=epoch)
-    writer.add_scalar(tag="DCGAN/DFL", scalar_value=discriminator_fake_loss.avg, global_step=epoch)
-    writer.add_scalar(tag="DCGAN/GL", scalar_value=generator_loss.avg, global_step=epoch)
+    writer.add_scalar(tag="DCGAN/DRL", scalar_value=discriminator_real_loss.avg, global_step=epoch + 1)
+    writer.add_scalar(tag="DCGAN/DFL", scalar_value=discriminator_fake_loss.avg, global_step=epoch + 1)
+    writer.add_scalar(tag="DCGAN/GL", scalar_value=generator_loss.avg, global_step=epoch + 1)
+    writer.add_scalar(tag="DCGAN/dx", scalar_value=dx_record.avg, global_step=epoch + 1)
+    writer.add_scalar(tag="DCGAN/dgz1", scalar_value=dgz1_record.avg, global_step=epoch + 1)
+    writer.add_scalar(tag="DCGAN/dgz2", scalar_value=dgz2_record.avg, global_step=epoch + 1)
     # in the train end, we want to add some real images and fake images
-    real_image = utils.make_grid(real_image[:64, ...], nrow=8)
-    writer.add_image(tag="Real_Image", img_tensor=(real_image * 0.5) + 0.5, global_step=epoch)
-    noise = torch.randn(64, args.latent_dim, 1, 1).cuda()
-    fake_image = utils.make_grid(generator(noise), nrow=8)
-    writer.add_image(tag="Fake_Image", img_tensor=(fake_image * 0.5) + 0.5, global_step=epoch)
+    real_image = utils.make_grid(real_image[:16, ...], nrow=4)
+    writer.add_image(tag="Real_Image", img_tensor=(real_image * 0.5) + 0.5, global_step=epoch + 1)
+    noise = torch.randn(16, args.latent_dim, 1, 1).cuda()
+    fake_image = utils.make_grid(generator(noise), nrow=4)
+    writer.add_image(tag="Fake_Image", img_tensor=(fake_image * 0.5) + 0.5, global_step=epoch + 1)
 
 
 def save_checkpoint(state, filename='checkpoint.pth.tar'):
-    filefolder = '{}/DGCAN/parameter/train_time_{}'.format(args.base_path, state["args"].train_time)
+    filefolder = '{}/DCGAN/parameter/train_time_{}'.format(args.base_path, state["args"].train_time)
     if not path.exists(filefolder):
         os.makedirs(filefolder)
     torch.save(state, path.join(filefolder, filename))
